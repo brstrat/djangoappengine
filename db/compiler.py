@@ -52,6 +52,7 @@ NEGATION_MAP = {
     #'exact': '!=', # this might actually become individual '<' and '>' queries
 }
 
+NOT_PROVIDED = object()
 def safe_call(func):
     @wraps(func)
     def _func(*args, **kwargs):
@@ -118,16 +119,19 @@ class GAEQuery(NonrelQuery):
             yield self._make_entity(entity)
 
         if executed and not isinstance(query, MultiQuery):
-            self.query._gae_cursor = query.GetCompiledCursor()
+            try:
+                self.query._gae_cursor = query.GetCompiledCursor()
+            except:
+                pass
 
     @safe_call
-    def count(self, limit=None):
+    def count(self, limit=NOT_PROVIDED):
         if self.pk_filters is not None:
             return len(self.get_matching_pk(0, limit))
         if self.excluded_pks:
             return len(list(self.fetch(0, 2000)))
         kw = {}
-        if limit is not None:
+        if limit is not NOT_PROVIDED:
             kw['limit'] = limit
         return self._build_query().Count(**kw)
 
@@ -164,11 +168,19 @@ class GAEQuery(NonrelQuery):
             column = '__key__'
             db_table = self.query.get_meta().db_table
             if lookup_type in ('exact', 'in'):
+                '''
+				SIMPLE
+                Obie 2011-08-25: this trips up BRS security filtering
+                where id can be specified two times:
+                    1) once by the app
+                    2) once by BRS security
+
                 # Optimization: batch-get by key
                 if self.pk_filters is not None:
                     raise DatabaseError("You can't apply multiple AND filters "
                                         "on the primary key. "
                                         "Did you mean __in=[...]?")
+                '''
                 if not isinstance(value, (tuple, list)):
                     value = [value]
                 pks = [create_key(db_table, pk) for pk in value if pk]
@@ -270,7 +282,7 @@ class GAEQuery(NonrelQuery):
             if isinstance(value, Text):
                 raise DatabaseError('TextField is not indexed, by default, '
                                     "so you can't filter on it. Please add "
-                                    'an index definition for the column %s '
+                                    'an index definition for the column "%s" '
                                     'on the model %s.%s as described here:\n'
                                     'http://www.allbuttonspressed.com/blog/django/2010/07/Managing-per-field-indexes-on-App-Engine'
                                     % (column, self.query.model.__module__, self.query.model.__name__))
@@ -429,11 +441,13 @@ class SQLCompiler(NonrelCompiler):
         elif db_type == 'longtext':
             # long text fields cannot be indexed on GAE so use GAE's database
             # type Text
-            value = Text((isinstance(value, str) and value.decode('utf-8')) or value)
+            if value is not None:
+                value = Text(value.decode('utf-8') if isinstance(value, str) else value)
         elif db_type == 'text':
-            value = (isinstance(value, str) and value.decode('utf-8')) or value
+            value = value.decode('utf-8') if isinstance(value, str) else value
         elif db_type == 'blob':
-            value = Blob(value)
+            if value is not None:
+                value = Blob(value)
         elif type(value) is str:
             # always store unicode strings
             value = value.decode('utf-8')
@@ -473,7 +487,8 @@ class SQLUpdateCompiler(NonrelUpdateCompiler, SQLCompiler):
     def execute_sql(self, result_type=MULTI):
         # modify query to fetch pks only and then execute the query
         # to get all pks 
-        self.query.add_immediate_loading(['id'])
+        pk = self.query.model._meta.pk.name
+        self.query.add_immediate_loading([pk])
         pks = [row for row in self.results_iter()]
         self.update_entities(pks)
         return len(pks)

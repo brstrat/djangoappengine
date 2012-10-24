@@ -12,7 +12,9 @@ def setup_env():
     """Configures app engine environment for command-line apps."""
     # Try to import the appengine code from the system path.
     try:
+        from google.appengine.ext import deferred
         from google.appengine.api import apiproxy_stub_map
+        import yaml
     except ImportError:
         for k in [k for k in sys.modules if k.startswith('google')]:
             del sys.modules[k]
@@ -51,16 +53,30 @@ def setup_env():
         extra_paths = [sdk_path]
         lib = os.path.join(sdk_path, 'lib')
         # Automatically add all packages in the SDK's lib folder:
-        for dir in os.listdir(lib):
-            path = os.path.join(lib, dir)
+        for name in os.listdir(lib):
+            root = os.path.join(lib, name)
+            subdir = name
             # Package can be under 'lib/<pkg>/<pkg>/' or 'lib/<pkg>/lib/<pkg>/'
-            detect = (os.path.join(path, dir), os.path.join(path, 'lib', dir))
+            detect = (os.path.join(root, subdir), os.path.join(root, 'lib', subdir))
             for path in detect:
-                if os.path.isdir(path) and not dir == 'django':
+                if os.path.isdir(path):
                     extra_paths.append(os.path.dirname(path))
                     break
+            else:
+                if name == 'webapp2':
+                    extra_paths.append(root)
+                elif name.startswith('webob'):
+                    webob_version = name.split('_')[1]
+                    py_major, py_minor = sys.version_info[:2]
+                    if webob_version == '0' and py_major == 2 and py_minor == 5:
+                        extra_paths.append(root)
+                    elif webob_version == '1' and py_major == 2 and py_minor == 7:
+                        extra_paths.append(root)
+                        
         sys.path = extra_paths + sys.path
+        from google.appengine.ext import deferred
         from google.appengine.api import apiproxy_stub_map
+        
 
     setup_project()
     from .utils import have_appserver
@@ -90,6 +106,8 @@ def find_commands(management_dir):
                 [os.path.join(management_dir, 'commands')]) if not ispkg]
 
 def setup_threading():
+    if sys.version_info >= (2, 7):
+        return
     # XXX: GAE's threading.local doesn't work correctly with subclassing
     try:
         from django.utils._threading_local import local
@@ -110,8 +128,35 @@ def setup_logging():
         # manage.py command because this module gets imported from settings.py
         from django.conf import settings
         if not settings.DEBUG:
-            level = logging.INFO
+            level = settings.LOGGING_LEVEL
     logging.getLogger().setLevel(level)
+
+    log_format = os.environ.get('SIMPLE_LOG_FORMAT', None)
+    if log_format:
+        logger = logging.getLogger()
+        for handler in logger.handlers:
+            try:
+                handler.setFormatter(logging.Formatter(fmt=log_format))
+            except Exception:
+                logging.error("Failed to set log format: %s" % log_format)
+
+# returns the path to the pysrc folder in the pydev plugin folder below ECLIPSE_HOME
+def eclipse_pysrc_dir():
+    eclipse_dir = os.environ.get('ECLIPSE_HOME')
+    if eclipse_dir:
+        plugins_dir = os.path.join(eclipse_dir, 'plugins')
+        pydev_dirs = [a_dir for a_dir in os.listdir(plugins_dir) if a_dir.startswith('org.python.pydev_')]
+        if pydev_dirs:
+            pysrc_dir = os.path.join(os.path.join(plugins_dir, pydev_dirs[0]), 'pysrc')
+            return pysrc_dir if os.path.isdir(pysrc_dir) else None
+
+def pycharm_pydev_paths():
+    charm_home = os.environ.get('PYCHARM_HOME', None)
+    if not charm_home:
+        return
+    egg_path = os.path.join(charm_home, "pycharm-debug.egg")
+    pydev_path = os.path.join(egg_path, "pydev")
+    return [charm_home, egg_path, pydev_path]
 
 def setup_project():
     from .utils import have_appserver, on_production_server
@@ -140,14 +185,42 @@ def setup_project():
             logging.warn('Could not patch the default environment. '
                          'The subprocess module will not work correctly.')
 
+        pysrc_location = eclipse_pysrc_dir()
+        if pysrc_location and pysrc_location not in dev_appserver.FakeFile.ALLOWED_DIRS:
+            dev_appserver.FakeFile.ALLOWED_DIRS.update([pysrc_location])
+
+        # PyCharm remote debug mode support
+        charm_paths = pycharm_pydev_paths()
+        if charm_paths:
+            if charm_paths[0] not in dev_appserver.FakeFile.ALLOWED_DIRS:
+                logging.info("Setting up PyCharm remote debugging import support")
+                dev_appserver.FakeFile.ALLOWED_DIRS.update(charm_paths)
+
         try:
-            # Allow importing compiler/parser and _ssl modules (for https)
+            # Allow importing compiler/parser, _ssl (for https),
+            # _io for Python 2.7 io support on OS X
             dev_appserver.HardenedModulesHook._WHITE_LIST_C_MODULES.extend(
-                ('parser', '_ssl'))
+                ('parser', '_ssl', '_io'))
+            
+            #DJANGO_SIMPLE
+            dev_appserver.HardenedModulesHook._WHITE_LIST_C_MODULES.extend(
+                ('readline',))
+            
+            # debugger support
+            dev_appserver.HardenedModulesHook._WHITE_LIST_C_MODULES.extend(
+                ('termios', 'fcntl'))
+                
+            dev_appserver.HardenedModulesHook._WHITE_LIST_PARTIAL_MODULES['os'].append('popen')
+
+            if charm_paths or pysrc_location:
+                #To enable remote debugging we need socket.socket
+                dev_appserver.HardenedModulesHook._WHITE_LIST_PARTIAL_MODULES['socket'].append('socket')
+
         except AttributeError:
             logging.warn('Could not patch modules whitelist. '
                          'The compiler and parser modules will not work and '
                          'SSL support is disabled.')
+            
     elif not on_production_server:
         try:
             # Restore the real subprocess module
@@ -155,7 +228,7 @@ def setup_project():
             sys.modules['subprocess'] = subprocess
             # Re-inject the buffer() builtin into the subprocess module
             from google.appengine.tools import dev_appserver
-            subprocess.buffer = dev_appserver.buffer
+            subprocess.buffer = dev_appserver.buffer #@UndefinedVariable
         except Exception, e:
             logging.warn('Could not add the subprocess module to the sandbox: %s' % e)
 
